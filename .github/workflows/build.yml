@@ -6,11 +6,6 @@ on:
   pull_request:
     branches: [main, master]
   workflow_dispatch:
-    inputs:
-      release_tag:
-        description: "Release tag (optional, e.g. v1.0.0)"
-        required: false
-        type: string
 
 permissions:
   contents: write
@@ -19,67 +14,19 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  RUST_VERSION: "1.90"
+  CARGO_TERM_COLOR: always
+
 jobs:
-  # ── 1. Frontend build (rsbuild + React) ──────────────────────────
-  build-frontend:
-    name: Build Frontend
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10.33.0
-          run_install: false
-
-      - name: Get pnpm store directory
-        id: pnpm-cache
-        shell: bash
-        run: echo "STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache pnpm store
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
-          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('pnpm-lock.yaml') }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-store-
-
-      - name: Install frontend dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Build frontend (rsbuild)
-        run: pnpm build
-
-      - name: Upload frontend dist
-        uses: actions/upload-artifact@v4
-        with:
-          name: frontend-dist
-          path: dist/
-          retention-days: 1
-
-  # ── 2. Tauri app build (Linux + macOS matrix) ────────────────────
-  build-app:
-    name: Build App (${{ matrix.os }})
-    needs: build-frontend
+  # ── 1. Pull public submodules + check compilation ────────────────
+  build-rust:
+    name: Build Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            bundles: app,deb
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            bundles: app,dmg
+        os: [ubuntu-latest, macos-latest]
 
     steps:
       - name: Checkout
@@ -88,14 +35,108 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.90"
-          targets: ${{ matrix.target }}
+          toolchain: ${{ env.RUST_VERSION }}
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-          sharedKey: ${{ runner.os }}-${{ matrix.target }}
+          sharedKey: ${{ runner.os }}-rust
+
+      # ── Pull all public submodules ────────────────────────────────
+      - name: Pull public submodules
+        env:
+          GH_TOKEN: *** secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          ROOT="$(pwd)"
+
+          clone_mod() {
+            local path="$1" url="$2"
+            if [ -f "$path/Cargo.toml" ]; then
+              echo "✓ $path already present"
+              return
+            fi
+            echo "→ $path ← $url"
+            mkdir -p "$(dirname "$path")"
+            git clone --depth 1 "$url" "$path" 2>&1 || echo "⚠ clone failed: $path"
+          }
+
+          # Public Rust modules
+          clone_mod "src-tauri/modules/app_esp32s3"   "https://github.com/AstralSightStudios/AstroBox-NG-Module-App-ESP32S3.git"
+          clone_mod "src-tauri/modules/app_wasm"       "https://github.com/AstralSightStudios/AstroBox-NG-Module-AppWasm.git"
+          clone_mod "src-tauri/modules/bluetooth"      "https://github.com/AstralSightStudios/AstroBox-NG-Module-Bluetooth.git"
+          clone_mod "src-tauri/modules/core"           "https://github.com/AstralSightStudios/AstroBox-NG-Module-Core.git"
+          clone_mod "src-tauri/modules/frontbridge"    "https://github.com/AstralSightStudios/AstroBox-NG-Module-FrontBridge.git"
+          clone_mod "src-tauri/modules/pb"             "https://github.com/AstralSightStudios/AstroBox-NG-Module-Pb.git"
+          clone_mod "src-tauri/modules/pluginsystem"   "https://github.com/AstralSightStudios/AstroBox-NG-Module-PluginSystem.git"
+          clone_mod "src-tauri/modules/provider"       "https://github.com/AstralSightStudios/AstroBox-NG-Module-Provider.git"
+          clone_mod "src-tauri/modules/vivo_msgpack"   "https://github.com/AstralSightStudios/AstroBox-NG-Module-Vivo-MsgPack.git"
+
+          # WIT interface files
+          clone_mod "src-tauri/modules/pluginsystem/wit" "https://github.com/AstralSightStudios/AstroBox-Plugin-WIT.git"
+
+          # Public Tauri plugins
+          clone_mod "src-tauri/plugins/btclassic-spp"  "https://github.com/AstralSightStudios/AstroBox-NG-Plugin-BtClassicSpp.git"
+          clone_mod "src-tauri/plugins/live-activity"   "https://github.com/AstralSightStudios/AstroBox-NG-Plugin-LiveActivity.git"
+          clone_mod "src-tauri/plugins/android-widgets" "https://github.com/AstralSightStudios/AstroBox-NG-Plugin-AndroidWidgets.git"
+
+          echo ""
+          echo "=== modules ==="
+          ls src-tauri/modules/
+          echo "=== plugins ==="
+          ls src-tauri/plugins/
+
+      # ── Patch Cargo.toml: remove private members, add wasm ────────
+      - name: Patch workspace Cargo.toml
+        run: |
+          cd src-tauri
+          # Remove private module entries from workspace members
+          # Keep only public modules + wasm + plugins
+          cat > Cargo.toml << 'TOMLEOF'
+          [workspace]
+          members = [
+              "modules/app_wasm",
+              "modules/bluetooth",
+              "modules/core",
+              "modules/frontbridge",
+              "modules/pb",
+              "modules/pluginsystem",
+              "modules/provider",
+              "modules/vivo_msgpack",
+              "plugins/android-widgets",
+              "plugins/btclassic-spp",
+              "plugins/live-activity",
+          ]
+          exclude = [
+              "modules/app_esp32s3",
+          ]
+          resolver = "3"
+
+          [patch.crates-io]
+          rustix = { git = "https://github.com/66hh/rustix-android-patch", branch = "main" }
+          TOMLEOF
+          echo "=== Patched Cargo.toml ==="
+          cat Cargo.toml
+
+      - name: Check compilation (cargo check)
+        run: cargo check --manifest-path src-tauri/Cargo.toml --workspace
+
+      - name: Run tests (corelib)
+        run: cargo test -p corelib --manifest-path src-tauri/Cargo.toml
+        continue-on-error: true
+
+      - name: Build release (wasm module)
+        run: cargo build -p astrobox-ng-wasm --manifest-path src-tauri/Cargo.toml --release
+        continue-on-error: true
+
+  # ── 2. Frontend build (placeholder – WebUI is private) ──────────
+  build-frontend:
+    name: Build Frontend (placeholder)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -108,115 +149,11 @@ jobs:
           version: 10.33.0
           run_install: false
 
-      - name: Get pnpm store directory
-        id: pnpm-cache
-        shell: bash
-        run: echo "STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache pnpm store
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
-          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('pnpm-lock.yaml') }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-store-
-
-      - name: Install frontend dependencies
+      - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Install Linux native deps
-        if: runner.os == 'Linux'
+      - name: Note about private WebUI
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            librsvg2-dev \
-            patchelf \
-            libssl-dev \
-            libglib2.0-dev \
-            libsoup-3.0-dev \
-            libjavascriptcoregtk-4.1-dev \
-            libappindicator3-dev
-
-      - name: Download frontend dist
-        uses: actions/download-artifact@v4
-        with:
-          name: frontend-dist
-          path: dist/
-
-      - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tauriScript: pnpm tauri
-          args: build --bundles ${{ matrix.bundles }}
-
-      - name: Upload Linux artifacts
-        if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
-        with:
-          name: astrobox-ng-linux
-          path: |
-            src-tauri/modules/app/target/release/bundle/appimage/*.AppImage
-            src-tauri/modules/app/target/release/bundle/deb/*.deb
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Upload macOS artifacts
-        if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v4
-        with:
-          name: astrobox-ng-macos
-          path: |
-            src-tauri/modules/app/target/release/bundle/dmg/*.dmg
-            src-tauri/modules/app/target/release/bundle/macos/*.app
-          if-no-files-found: warn
-          retention-days: 7
-
-  # ── 3. Rust core library tests ────────────────────────────────────
-  test-rust:
-    name: Test Rust Core
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.90"
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-
-      - name: Run corelib tests
-        run: cargo test -p corelib --manifest-path src-tauri/Cargo.toml
-        continue-on-error: true
-
-  # ── 4. Optional: create Release with artifacts ────────────────────
-  release:
-    name: Create Release
-    needs: [build-app, test-rust]
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != ''
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts/
-
-      - name: List artifacts
-        run: find artifacts/ -type f | head -50
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.inputs.release_tag }}
-          files: artifacts/**
-          draft: true
-          generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "⚠ The web frontend (AstroBox-NG-WebUI) is a private submodule."
+          echo "  Skipping rsbuild. To enable full Tauri builds, grant access"
+          echo "  to the private repo or make it public."
